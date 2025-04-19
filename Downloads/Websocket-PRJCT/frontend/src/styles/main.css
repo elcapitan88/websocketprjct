@@ -1,0 +1,125 @@
+/* src/styles/main.css - adding to what we created earlier */
+
+/* Account Info Component */
+.account-info {
+    margin-bottom: 20px;
+  }
+  
+  .account-details {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 10px;
+  }
+  
+  .status {
+    display: inline-block;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-weight: bold;
+  }
+  
+  .status.active {
+    background-color: #c8e6c9;
+    color: #2e7d32;
+  }
+  
+  .status.inactive {
+    background-color: #ffcdd2;
+    color: #c62828;
+  }
+  
+  /* PnL Display Component */
+  .pnl-display {
+    margin-bottom: 20px;
+  }
+  
+  .pnl-summary {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 20px;
+  }
+  
+  .pnl-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 15px;
+    border-radius: 4px;
+    background-color: #f9f9f9;
+  }
+  
+  .pnl-label {
+    font-weight: bold;
+    margin-bottom: 8px;
+  }
+  
+  .pnl-value {
+    font-size: 1.5rem;
+    font-weight: bold;
+  }
+  
+  .profit {
+    color: #2e7d32;
+  }
+  
+  .loss {
+    color: #c62828;
+  }
+  
+  /* Positions List Component */
+  .positions-list {
+    overflow: hidden;
+  }
+  
+  .positions-table-container {
+    overflow-x: auto;
+  }
+  
+  .positions-table {
+    width: 100%;
+    border-collapse: collapse;
+    text-align: left;
+  }
+  
+  .positions-table th, 
+  .positions-table td {
+    padding: 12px 16px;
+    border-bottom: 1px solid #e0e0e0;
+  }
+  
+  .positions-table th {
+    background-color: #f5f5f5;
+    font-weight: bold;
+  }
+  
+  .positions-table tr:hover {
+    background-color: #f9f9f9;
+  }
+  
+  /* Dashboard Layout */
+  .dashboard {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 20px;
+  }
+  
+  @media (min-width: 768px) {
+    .dashboard {
+      grid-template-columns: repeat(2, 1fr);
+    }
+  }
+  
+  /* Responsive adjustments */
+  @media (max-width: 600px) {
+    .App {
+      padding: 10px;
+    }
+    
+    .card {
+      padding: 15px;
+    }
+    
+    .pnl-item {
+      padding: 10px;
+    }
+  }
