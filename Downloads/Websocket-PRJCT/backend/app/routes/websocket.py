@@ -1,3 +1,5 @@
+# app/routes/websocket.py
+
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query, Depends, HTTPException, status
 from jose import JWTError, jwt
 import logging
@@ -42,7 +44,7 @@ async def get_token_from_query(token: str = Query(...)):
 
 @router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
-    """WebSocket endpoint for real-time trading data"""
+    """WebSocket endpoint for real-time trading data from Tradovate"""
     try:
         # Validate the token
         tradovate_token = None
@@ -53,21 +55,24 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
             await websocket.close(code=1008, reason=str(e.detail))
             return
         
-        # Connect to the WebSocket manager
+        logger.info(f"Establishing WebSocket connection with Tradovate token")
+        
+        # Connect to the WebSocket manager with Tradovate integration
         connected = await websocket_manager.connect(websocket, tradovate_token)
         if not connected:
+            logger.error("Failed to establish connection with WebSocket manager")
             return
         
         try:
             # Keep the connection alive until disconnection
             while True:
                 # Wait for messages from the client (if needed)
-                # For now, we just keep the connection open
                 data = await websocket.receive_text()
                 
                 # Process client messages if needed
-                # In this simple example, we're just receiving data from Tradovate
-                # and forwarding it to the client
+                # In our implementation, this would typically be used for
+                # requesting specific data or actions
+                logger.debug(f"Received message from client: {data}")
                 
         except WebSocketDisconnect:
             logger.info("Client disconnected")

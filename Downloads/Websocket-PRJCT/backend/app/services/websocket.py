@@ -1,11 +1,12 @@
+# app/services/websocket.py
+
 import asyncio
 import json
 import logging
 import websockets
-from typing import Dict, List, Set, Any, Optional
+from typing import Dict, List, Any, Optional
 from fastapi import WebSocket, WebSocketDisconnect
 from datetime import datetime
-import random  # For demo data simulation
 
 from app.models.schemas import AccountInfo, Position, PnL, WebSocketMessage
 from app.services.tradovate_api import tradovate_client
@@ -17,9 +18,10 @@ class WebSocketManager:
         self.active_connections: Dict[str, WebSocket] = {}
         self.tradovate_connections: Dict[str, websockets.WebSocketClientProtocol] = {}
         self.token_to_account_id: Dict[str, int] = {}
+        self.heartbeat_tasks: Dict[str, asyncio.Task] = {}
         
-    async def connect(self, websocket: WebSocket, token: str):
-        """Connect a client WebSocket"""
+    async def connect(self, websocket: WebSocket, token: str) -> bool:
+        """Connect a client WebSocket and establish connection to Tradovate"""
         try:
             # Accept the WebSocket connection
             await websocket.accept()
@@ -41,17 +43,8 @@ class WebSocketManager:
             # Send initial account info
             await self.send_account_info(token, account_info)
             
-            # Get and send initial positions
-            positions = await tradovate_client.get_positions(token, account_id)
-            await self.send_positions(token, positions)
-            
-            # Get and send initial PnL
-            pnl = await tradovate_client.get_pnl(token, account_id)
-            await self.send_pnl(token, pnl)
-            
-            # In a real implementation, we would connect to Tradovate WebSocket here
-            # For the demo, we'll use a simulation
-            asyncio.create_task(self.simulate_tradovate_updates(token, account_id))
+            # Connect to Tradovate WebSocket
+            await self.connect_to_tradovate(token, account_id)
             
             return True
             
@@ -63,23 +56,217 @@ class WebSocketManager:
                 pass
             return False
 
-    async def disconnect(self, token: str):
-        """Disconnect a client WebSocket"""
-        if token in self.active_connections:
-            # Close the connection to Tradovate if it exists
-            if token in self.tradovate_connections:
+    async def connect_to_tradovate(self, token: str, account_id: int):
+        """Establish connection to Tradovate WebSocket"""
+        if token in self.tradovate_connections:
+            # Already connected
+            return
+            
+        try:
+            # Get WebSocket URL from settings
+            ws_url = tradovate_client.ws_url
+            logger.info(f"Connecting to Tradovate WebSocket at {ws_url}")
+            
+            # Connect to Tradovate WebSocket
+            tradovate_ws = await websockets.connect(ws_url)
+            self.tradovate_connections[token] = tradovate_ws
+            
+            # Start heartbeat task
+            self.heartbeat_tasks[token] = asyncio.create_task(
+                self.handle_tradovate_heartbeat(token, tradovate_ws)
+            )
+            
+            # Start message handler task
+            asyncio.create_task(
+                self.handle_tradovate_messages(token, tradovate_ws, account_id)
+            )
+            
+        except Exception as e:
+            logger.error(f"Error connecting to Tradovate WebSocket: {str(e)}")
+            if token in self.active_connections:
                 try:
-                    await self.tradovate_connections[token].close()
-                    del self.tradovate_connections[token]
+                    await self.active_connections[token].close(
+                        code=1011, 
+                        reason="Error connecting to Tradovate"
+                    )
                 except:
                     pass
+                    
+            await self.disconnect(token)
+
+    async def handle_tradovate_heartbeat(self, token: str, ws: websockets.WebSocketClientProtocol):
+        """Handle heartbeat for Tradovate WebSocket connection"""
+        try:
+            last_heartbeat = datetime.now()
             
-            # Remove the connection
+            while token in self.tradovate_connections:
+                # Send heartbeat every 2.5 seconds
+                current_time = datetime.now()
+                if (current_time - last_heartbeat).total_seconds() >= 2.5:
+                    logger.debug("Sending heartbeat to Tradovate")
+                    await ws.send("[]")  # Empty array is the heartbeat
+                    last_heartbeat = current_time
+                    
+                # Check for any messages without blocking too long
+                await asyncio.sleep(0.5)
+                
+        except Exception as e:
+            logger.error(f"Error in Tradovate heartbeat handler: {str(e)}")
+            await self.disconnect(token)
+
+    async def handle_tradovate_messages(self, token: str, ws: websockets.WebSocketClientProtocol, account_id: int):
+        """Handle messages from Tradovate WebSocket"""
+        try:
+            # Wait for the initial open frame ('o')
+            msg = await ws.recv()
+            logger.info(f"Tradovate WebSocket initial message: {msg}")
+            
+            if msg.startswith('o'):
+                # Send authorization request
+                auth_request = f"authorize\n1\n\n{token}"
+                logger.info("Sending authorization request to Tradovate")
+                await ws.send(auth_request)
+                
+                # Wait for authorization response
+                while token in self.tradovate_connections:
+                    msg = await ws.recv()
+                    logger.debug(f"Received from Tradovate: {msg}")
+                    
+                    # Skip heartbeat messages
+                    if msg.startswith('h'):
+                        logger.debug("Received heartbeat from Tradovate")
+                        continue
+                        
+                    # Process data messages
+                    if msg.startswith('a'):
+                        data_str = msg[1:]  # Remove the 'a' prefix
+                        data = json.loads(data_str)
+                        
+                        # Process each response in the array
+                        for response in data:
+                            logger.info(f"Processing Tradovate response: {response}")
+                            
+                            # Check if this is the auth response
+                            if response.get('s') == 200 and response.get('i') == 1:
+                                logger.info("Successfully authorized with Tradovate, subscribing to data")
+                                
+                                # Subscribe to user account updates
+                                subscribe_request = f"user/syncrequest\n2\n\n{{\"users\": [{account_id}]}}"
+                                await ws.send(subscribe_request)
+                                
+                            # Process entity data for ongoing updates
+                            elif 'e' in response and response['e'] == 'props':
+                                if 'd' in response:
+                                    entity_data = response['d']
+                                    if 'entity' in entity_data and 'entityType' in entity_data:
+                                        await self.process_entity_update(token, entity_data)
+                                        
+                            # Process initial sync data
+                            elif 'd' in response and 'users' in response['d']:
+                                await self.process_initial_sync(token, response['d'])
+                                
+            else:
+                logger.error(f"Unexpected initial message from Tradovate: {msg}")
+                await self.disconnect(token)
+                    
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.error(f"Tradovate WebSocket connection closed: {e}")
+            await self.disconnect(token)
+        except Exception as e:
+            logger.error(f"Error in Tradovate message handler: {str(e)}")
+            await self.disconnect(token)
+
+    async def process_account_update(self, token: str, data: Dict[str, Any]):
+        """Process account updates from Tradovate"""
+        try:
+            account_info = AccountInfo(
+                id=data.get('id'),
+                name=data.get('name', 'Unknown'),
+                userId=data.get('userId', 0),
+                accountType=data.get('accountType', 'Unknown'),
+                active=data.get('active', False),
+                tradingEnabled=data.get('tradingEnabled', False),
+                marginEnabled=data.get('marginEnabled', False),
+                cashBalance=data.get('cashBalance', 0.0),
+                status=data.get('active', False)
+            )
+            
+            await self.send_account_info(token, account_info)
+            
+        except Exception as e:
+            logger.error(f"Error processing account update: {str(e)}")
+
+    async def process_position_update(self, token: str, data: Dict[str, Any]):
+        """Process position updates from Tradovate"""
+        try:
+            # We need to fetch contract info to get symbol
+            # For now, use a placeholder
+            symbol = f"Contract-{data.get('contractId', 'Unknown')}"
+            
+            position = Position(
+                id=data.get('id', 0),
+                accountId=data.get('accountId', 0),
+                contractId=data.get('contractId', 0),
+                netPos=data.get('netPos', 0),
+                netPrice=data.get('netPrice', 0),
+                timestamp=data.get('timestamp', datetime.now().isoformat()),
+                symbol=symbol,
+                entryPrice=data.get('avgPrice', 0),
+                marketPrice=data.get('lastPrice', data.get('avgPrice', 0)),
+                pnl=data.get('pnl', 0)
+            )
+            
+            # Get all positions for this account
+            positions = [position]  # In a real impl, we'd maintain a list of all positions
+            
+            await self.send_positions(token, positions)
+            
+        except Exception as e:
+            logger.error(f"Error processing position update: {str(e)}")
+
+    async def process_cash_balance_update(self, token: str, data: Dict[str, Any], account_id: int):
+        """Process cash balance updates from Tradovate"""
+        try:
+            # In a real implementation, we'd calculate PnL from positions
+            # For now, use simplified values
+            pnl = PnL(
+                netPnl=data.get('cashBalance', 0),
+                realizedPnl=0,  # Would need real data from Tradovate
+                unrealizedPnl=0,  # Would need real data from Tradovate
+                accountId=account_id
+            )
+            
+            await self.send_pnl(token, pnl)
+            
+        except Exception as e:
+            logger.error(f"Error processing cash balance update: {str(e)}")
+
+    async def disconnect(self, token: str):
+        """Disconnect a client and clean up resources"""
+        # Close Tradovate connection
+        if token in self.tradovate_connections:
+            try:
+                await self.tradovate_connections[token].close()
+            except:
+                pass
+            del self.tradovate_connections[token]
+            
+        # Cancel heartbeat task
+        if token in self.heartbeat_tasks:
+            self.heartbeat_tasks[token].cancel()
+            del self.heartbeat_tasks[token]
+            
+        # Remove client connection
+        if token in self.active_connections:
+            try:
+                await self.active_connections[token].close()
+            except:
+                pass
             del self.active_connections[token]
             
-            # Remove the account ID mapping
-            if token in self.token_to_account_id:
-                del self.token_to_account_id[token]
+        # Clean up account mapping
+        if token in self.token_to_account_id:
+            del self.token_to_account_id[token]
 
     async def send_message(self, token: str, message: Any):
         """Send a message to a specific client"""
@@ -117,158 +304,6 @@ class WebSocketManager:
             payload=pnl
         )
         await self.send_message(token, message.dict())
-
-    async def simulate_tradovate_updates(self, token: str, account_id: int):
-        """Simulate real-time updates from Tradovate WebSocket"""
-        try:
-            # In a real implementation, we would connect to Tradovate's WebSocket API
-            # and forward events to our client. For demo purposes, we'll simulate data.
-            
-            # Generate some initial positions
-            symbols = ["ES", "NQ", "YM", "RTY", "CL", "GC"]
-            positions = []
-            
-            # Create 1-3 random positions
-            num_positions = random.randint(1, 3)
-            for i in range(num_positions):
-                symbol = random.choice(symbols)
-                net_pos = random.choice([-5, -3, -2, -1, 1, 2, 3, 5])
-                entry_price = round(random.uniform(1000, 5000), 2)
-                market_price = entry_price  # Start at breakeven
-                
-                positions.append(Position(
-                    id=i + 1000,
-                    accountId=account_id,
-                    contractId=i + 2000,
-                    netPos=net_pos,
-                    netPrice=entry_price,
-                    timestamp=datetime.now().isoformat(),
-                    symbol=symbol,
-                    entryPrice=entry_price,
-                    marketPrice=market_price,
-                    pnl=0.0  # Start at breakeven
-                ))
-            
-            # Send initial positions
-            await self.send_positions(token, positions)
-            
-            # Calculate and send initial PnL
-            pnl = PnL(
-                netPnl=0.0,
-                realizedPnl=0.0,
-                unrealizedPnl=0.0,
-                accountId=account_id
-            )
-            await self.send_pnl(token, pnl)
-            
-            # Continuous updates
-            while token in self.active_connections:
-                # Wait a random interval (1-5 seconds)
-                await asyncio.sleep(random.uniform(1, 5))
-                
-                # Update market prices and PnL
-                total_pnl = 0.0
-                for position in positions:
-                    # Random price change (-0.5% to +0.5%)
-                    price_change_pct = random.uniform(-0.005, 0.005)
-                    new_market_price = position.marketPrice * (1 + price_change_pct)
-                    position.marketPrice = round(new_market_price, 2)
-                    
-                    # Calculate new PnL
-                    position.pnl = round((position.marketPrice - position.entryPrice) * position.netPos, 2)
-                    total_pnl += position.pnl
-                
-                # Send updated positions
-                await self.send_positions(token, positions)
-                
-                # Update PnL
-                # In a real system, this would come from Tradovate
-                # For demo, we'll calculate from our simulated positions
-                unrealized_pnl = total_pnl
-                realized_pnl = pnl.realizedPnl  # Unchanged for demo
-                
-                new_pnl = PnL(
-                    netPnl=round(realized_pnl + unrealized_pnl, 2),
-                    realizedPnl=realized_pnl,
-                    unrealizedPnl=round(unrealized_pnl, 2),
-                    accountId=account_id
-                )
-                
-                # Only send if PnL changed
-                if new_pnl.netPnl != pnl.netPnl or new_pnl.unrealizedPnl != pnl.unrealizedPnl:
-                    pnl = new_pnl
-                    await self.send_pnl(token, pnl)
-                
-                # Occasionally (10% chance), modify a position
-                if random.random() < 0.1:
-                    if positions and len(positions) > 0:
-                        # Pick a random position
-                        pos_idx = random.randint(0, len(positions) - 1)
-                        position = positions[pos_idx]
-                        
-                        # Either modify qty or close position
-                        if random.random() < 0.7:
-                            # Modify quantity
-                            qty_change = random.choice([-2, -1, 1, 2])
-                            new_qty = position.netPos + qty_change
-                            
-                            if new_qty != 0:
-                                position.netPos = new_qty
-                                # Recalculate PnL
-                                position.pnl = round((position.marketPrice - position.entryPrice) * position.netPos, 2)
-                            else:
-                                # If new qty is 0, close the position
-                                closed_pnl = position.pnl
-                                positions.pop(pos_idx)
-                                
-                                # Add to realized PnL
-                                pnl.realizedPnl = round(pnl.realizedPnl + closed_pnl, 2)
-                                pnl.netPnl = round(pnl.realizedPnl + pnl.unrealizedPnl, 2)
-                        else:
-                            # Close position
-                            closed_pnl = position.pnl
-                            positions.pop(pos_idx)
-                            
-                            # Add to realized PnL
-                            pnl.realizedPnl = round(pnl.realizedPnl + closed_pnl, 2)
-                            pnl.netPnl = round(pnl.realizedPnl + pnl.unrealizedPnl, 2)
-                        
-                        # Send updated positions and PnL
-                        await self.send_positions(token, positions)
-                        await self.send_pnl(token, pnl)
-                
-                # Occasionally (5% chance), add a new position
-                if random.random() < 0.05:
-                    symbol = random.choice(symbols)
-                    net_pos = random.choice([-5, -3, -2, -1, 1, 2, 3, 5])
-                    entry_price = round(random.uniform(1000, 5000), 2)
-                    market_price = entry_price  # Start at breakeven
-                    
-                    new_position = Position(
-                        id=len(positions) + 1000,
-                        accountId=account_id,
-                        contractId=len(positions) + 2000,
-                        netPos=net_pos,
-                        netPrice=entry_price,
-                        timestamp=datetime.now().isoformat(),
-                        symbol=symbol,
-                        entryPrice=entry_price,
-                        marketPrice=market_price,
-                        pnl=0.0  # Start at breakeven
-                    )
-                    
-                    positions.append(new_position)
-                    await self.send_positions(token, positions)
-        
-        except Exception as e:
-            logger.error(f"Error in Tradovate simulation: {str(e)}")
-        finally:
-            # If we exit the loop, ensure we disconnect
-            if token in self.active_connections:
-                try:
-                    await self.disconnect(token)
-                except:
-                    pass
 
 # Create a global instance
 websocket_manager = WebSocketManager()
